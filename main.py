@@ -62,6 +62,7 @@ HTML_PAGE = """
 
     <script>
     window.translate = async function() {
+        console.log('translate() called', document.getElementById('text').value, document.getElementById('lang').value);
         const text = document.getElementById('text').value.trim();
         const lang = document.getElementById('lang').value;
         const out = document.getElementById('result');
@@ -74,7 +75,7 @@ HTML_PAGE = """
             const res = await fetch('/translate', {
                 method: 'POST',
                 headers: {'Content-Type':'application/json'},
-                body: JSON.stringify({ text, target: lang })
+                body: JSON.stringify({text, target: lang})
             });
             const data = await res.json();
             if (data.success) {
@@ -89,6 +90,23 @@ HTML_PAGE = """
     document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('translateBtn').addEventListener('click', translate);
     });
+    </script>
+
+    <!-- Stripe.js -->
+    <script src="https://js.stripe.com/v3/"></script>
+
+    <!-- Checkout button -->
+    <button id="checkout-button" class="translate-btn">Subscribe for $9.99/mo</button>
+    <script>
+      const stripe = Stripe('pk_live_51Rhy6qCjwnT8QEVd4z0LnPKz2fgKfc4Yw7YXo1VwtHUK8ijFPjmoZpmaeCPUEr2pDAdwLsMMi8xaMdTKvxY6Wfdd00sxxNAKcD');
+      document.getElementById('checkout-button').addEventListener('click', () => {
+        stripe.redirectToCheckout({
+          lineItems: [{ price: 'prod_SdG1umfWV7pCp6', quantity: 1 }], // replace with your PRICE_ID (starts with price_)
+          mode: 'subscription',
+          successUrl: window.location.origin + '?success=true',
+          cancelUrl: window.location.origin + '?canceled=true',
+        });
+      });
     </script>
 </body>
 </html>
@@ -106,11 +124,10 @@ def translate():
         if not text:
             return jsonify({'success': False, 'error': 'No text provided'})
         target = body.get('target','ES')
-        # Pro endpoint for DeepL API Pro
         resp = requests.post(
-            "https://api.deepl.com/v2/translate",
+            "https://api-free.deepl.com/v2/translate",
             headers={"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"},
-            data={"text": text, "target_lang": target, "preserve_formatting": "1"},
+            data={"text": text, "target_lang": target, "preserve_formatting":"1"},
             timeout=10
         )
         if resp.status_code == 200:
