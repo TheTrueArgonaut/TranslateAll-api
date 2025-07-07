@@ -1,10 +1,23 @@
 from flask import Flask, request, jsonify, render_template_string
+from flask_cors import CORS
 import requests
 import os
+import stripe
+import sqlite3
+import uuid
+from datetime import datetime
 
 app = Flask(__name__)
+CORS(app)
 
 DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "74732027-e377-4323-8a86-2744ab7ae7ca")
+# Read the Stripe Secret Key from env for live mode
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+# Read the Stripe Publishable Key from env for live mode, defaulting to your live key if unset
+stripe_publishable_key = os.getenv(
+    "STRIPE_PUBLISHABLE_KEY",
+    "pk_live_51Rhy6qCjwnT8QEVd4z0LnPKz2fgKfc4Yw7YXo1VwtHUK8ijFPjmoZpmaeCPUEr2pDAdwLsMMi8xaMdTKvxY6Wfdd00sxxNAKcD"
+)
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -98,26 +111,99 @@ HTML_PAGE = """
     <!-- Checkout button -->
     <button id="checkout-button" class="translate-btn">Subscribe for $9.99/mo</button>
     <script>
-      const stripe = Stripe('pk_live_51Rhy6qCjwnT8QEVd4z0LnPKz2fgKfc4Yw7YXo1VwtHUK8ijFPjmoZpmaeCPUEr2pDAdwLsMMi8xaMdTKvxY6Wfdd00sxxNAKcD');
-      document.getElementById('checkout-button').addEventListener('click', () => {
-        stripe.redirectToCheckout({
-          lineItems: [{ price: 'prod_SdG1umfWV7pCp6', quantity: 1 }], // replace with your PRICE_ID (starts with price_)
-          mode: 'subscription',
-          successUrl: window.location.origin + '?success=true',
-          cancelUrl: window.location.origin + '?canceled=true',
-        });
+      const stripe = Stripe('{{ stripe_publishable_key }}');
+      document.getElementById('checkout-button').addEventListener('click', async () => {
+        try {
+          const resp = await fetch('/create-checkout-session', { method: 'POST' });
+          const data = await resp.json();
+          if (data.error) {
+            console.error('Checkout session error:', data.error);
+            return;
+          }
+          if (!data.sessionId) {
+            console.error('No sessionId returned from server');
+            return;
+          }
+          await stripe.redirectToCheckout({ sessionId: data.sessionId });
+        } catch (err) {
+          console.error('Network or server error:', err);
+        }
       });
     </script>
 </body>
 </html>
 """
 
+# Initialize SQLite database for API keys
+def init_db():
+    conn = sqlite3.connect('api_keys.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS api_keys (
+            key TEXT PRIMARY KEY,
+            created TIMESTAMP,
+            uses INTEGER DEFAULT 0
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
 @app.route('/')
 def home():
-    return render_template_string(HTML_PAGE)
+    # Render the HTML template with the Stripe publishable key
+    return render_template_string(HTML_PAGE, stripe_publishable_key=stripe_publishable_key)
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'healthy', 'service': 'Translate All API'})
+
+@app.route('/create-key', methods=['POST'])
+def create_key():
+    # generate and store a new API key
+    new_key = uuid.uuid4().hex
+    conn = sqlite3.connect('api_keys.db')
+    c = conn.cursor()
+    c.execute('INSERT INTO api_keys (key, created) VALUES (?, ?)', (new_key, datetime.utcnow()))
+    conn.commit()
+    conn.close()
+    return jsonify({'apiKey': new_key})
+
+@app.route('/create-checkout-session', methods=['POST'])
+def create_checkout_session():
+    try:
+        session = stripe.checkout.Session.create(
+            line_items=[{"price": "price_1RhzVOCjwnT8QEVdyoyyCLQ9", "quantity": 1}],
+            mode="subscription",
+            success_url=request.host_url + "?success=true",
+            cancel_url=request.host_url + "?canceled=true",
+        )
+        return jsonify({"sessionId": session.id})
+    except Exception as e:
+        app.logger.error(f"Stripe session creation failed: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/translate', methods=['POST'])
 def translate():
+    # enforce API key, quota checking
+    api_key = request.headers.get('X-API-KEY')
+    if not api_key:
+        return jsonify({'success': False, 'error': 'API key required'}), 401
+    conn = sqlite3.connect('api_keys.db')
+    c = conn.cursor()
+    c.execute('SELECT uses FROM api_keys WHERE key = ?', (api_key,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Invalid API key'}), 401
+    uses = row[0] + 1
+    if uses > 2000:
+        conn.close()
+        return jsonify({'success': False, 'error': 'Quota exceeded'}), 403
+    c.execute('UPDATE api_keys SET uses = ? WHERE key = ?', (uses, api_key))
+    conn.commit()
+    conn.close()
     try:
         body = request.get_json() or {}
         text = body.get('text','').strip()
@@ -125,7 +211,7 @@ def translate():
             return jsonify({'success': False, 'error': 'No text provided'})
         target = body.get('target','ES')
         resp = requests.post(
-            "https://api-free.deepl.com/v2/translate",
+            "https://api.deepl.com/v2/translate",
             headers={"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"},
             data={"text": text, "target_lang": target, "preserve_formatting":"1"},
             timeout=10
@@ -137,10 +223,6 @@ def translate():
             return jsonify({'success': False, 'error': f'DeepL error {resp.status_code}'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/health')
-def health():
-    return jsonify({'status': 'healthy', 'service': 'Translate All API'})
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 8080))
